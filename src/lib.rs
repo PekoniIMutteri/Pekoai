@@ -6,18 +6,6 @@ use std::{
 
 const EOF_ERR: &str = "End of file before end bytes.";
 
-//
-//
-//
-//
-// TODO: DataChunk -> from_iter
-//       Then all_pixels
-//
-//
-//
-//
-
-#[allow(dead_code)]
 /// A DataChunk is a chunk of data saved in a QOI file.
 #[derive(PartialEq)]
 enum DataChunk {
@@ -62,7 +50,6 @@ fn next_byte(iter: &mut Iter<'_, u8>, string: &str) -> Result<u8> {
     }
 }
 
-#[allow(dead_code, unused_variables)]
 impl DataChunk {
     fn is_0(&self) -> bool {
         *self == DataChunk::Index(0)
@@ -71,7 +58,18 @@ impl DataChunk {
         *self == DataChunk::Index(1)
     }
     fn should_update_array(&self) -> bool {
-        !matches!(self, DataChunk::Index(_) | DataChunk::Run(_))
+        !matches!(self, DataChunk::Index(_))
+    }
+    fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            DataChunk::Rgb(r, g, b) => vec![0b11111110, *r, *g, *b],
+            DataChunk::Rgba(r, g, b, a) => vec![0b11111111, *r, *g, *b, *a],
+            // 0b00000000 | index <=> index
+            DataChunk::Index(index) => vec![*index],
+            DataChunk::Diff(dr, dg, db) => vec![0b01000000 | (dr << 4) | (dg << 2) | db],
+            DataChunk::Luma(dg, dr_dg, db_dg) => vec![0b10000000 | dg, (dr_dg << 4) | db_dg],
+            DataChunk::Run(count) => vec![0b11000000 | count],
+        }
     }
     fn from_iter(iter: &mut Iter<'_, u8>) -> Result<DataChunk> {
         let first = next_byte(iter, EOF_ERR)?;
@@ -111,16 +109,9 @@ impl DataChunk {
         }
         error("Not a possible QOI encoding.")
     }
+
     fn to_color(&self, previous: &Color, array: &[Color; 64]) -> Vec<Color> {
         match self {
-            /*
-            DataChunk::Rgb(_, _, _) => vec![Color::RED],
-            DataChunk::Rgba(_, _, _, _) => vec![Color::GREEN],
-            DataChunk::Index(_) => vec![Color::BLUE],
-            DataChunk::Diff(_, _, _) => vec![Color::YELLOW],
-            DataChunk::Luma(_, _, _) => vec![Color::PINK],
-            DataChunk::Run(count) => vec![Color::CYAN; *count as usize + 1],
-            */
             DataChunk::Rgb(r, g, b) => vec![Color::new_alpha(*r, *g, *b, previous.a)],
             DataChunk::Rgba(r, g, b, a) => vec![Color::new_alpha(*r, *g, *b, *a)],
             DataChunk::Index(index) => vec![array[*index as usize]],
@@ -147,32 +138,32 @@ impl DataChunk {
             DataChunk::Run(count) => vec![*previous; *count as usize + 1],
         }
     }
+}
 
-    fn all_pixels(iter: &mut Iter<'_, u8>) -> Result<Vec<Color>> {
-        let mut previous = Color::BLACK;
-        let mut array = [Color::TRANS; 64];
-        let mut pixels = vec![];
-        let mut zero_count = 0;
-        loop {
-            let next_data = DataChunk::from_iter(iter)?;
-            if next_data.is_0() {
-                zero_count += 1;
-            } else if zero_count >= 7 && next_data.is_1() {
-                break;
-            } else {
-                zero_count = 0;
-            }
-            let next_color = next_data.to_color(&previous, &array);
-            pixels.push(next_color);
-            previous = *pixels.last().unwrap().last().unwrap();
-            if next_data.should_update_array() {
-                array[index_position(&previous)] = previous;
-            }
+fn all_pixels(iter: &mut Iter<'_, u8>) -> Result<Vec<Color>> {
+    let mut previous = Color::BLACK;
+    let mut array = [Color::TRANS; 64];
+    let mut pixels = vec![];
+    let mut zero_count = 0;
+    loop {
+        let next_data = DataChunk::from_iter(iter)?;
+        if next_data.is_0() {
+            zero_count += 1;
+        } else if zero_count >= 7 && next_data.is_1() {
+            break;
+        } else {
+            zero_count = 0;
         }
-        let mut result: Vec<Color> = pixels.iter().flatten().copied().collect();
-        result.truncate(result.len() - 7);
-        Ok(result)
+        let next_color = next_data.to_color(&previous, &array);
+        pixels.push(next_color);
+        previous = *pixels.last().unwrap().last().unwrap();
+        if next_data.should_update_array() {
+            array[index_position(&previous)] = previous;
+        }
     }
+    let mut result: Vec<Color> = pixels.iter().flatten().copied().collect();
+    result.truncate(result.len() - 7);
+    Ok(result)
 }
 
 fn index_position(color: &Color) -> usize {
@@ -183,7 +174,6 @@ fn index_position(color: &Color) -> usize {
     (3 * r + 5 * g + 7 * b + 11 * a) % 64
 }
 
-#[allow(dead_code)]
 #[derive(Default, Debug)]
 struct Header {
     /// Magic number "qoif"
@@ -227,6 +217,14 @@ impl Header {
 
         Ok(header)
     }
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = self.magic.map(|ch| ch as u8).to_vec();
+        bytes.extend(u32::to_be_bytes(self.width));
+        bytes.extend(u32::to_be_bytes(self.height));
+        bytes.push(self.channels);
+        bytes.push(self.colorspace);
+        bytes
+    }
 }
 
 fn u32_from_iter(iter: &mut Iter<'_, u8>) -> Result<u32> {
@@ -241,13 +239,12 @@ fn u32_from_iter(iter: &mut Iter<'_, u8>) -> Result<u32> {
     Ok(u32::from_be_bytes(tmp))
 }
 
-#[allow(dead_code, unused_variables)]
 /// Loads a QOI (compressed raster image) and returns it as a Pimage.
 pub fn load_qoi(path_name: &str) -> Result<Pimage> {
     let file = std::fs::read(path_name)?;
     let mut file_iter = file.iter();
     let header = Header::from_iter(&mut file_iter)?;
-    let pixels = DataChunk::all_pixels(&mut file_iter)?;
+    let pixels = all_pixels(&mut file_iter)?;
     let mut pimage = Pimage::new(header.width as usize, header.height as usize, Color::BLACK);
     if pixels.len() > pimage.width() * pimage.height() {
         return error("Too many pixels.");
@@ -267,9 +264,78 @@ pub fn load_qoi(path_name: &str) -> Result<Pimage> {
     Ok(pimage)
 }
 
+fn pixels_to_data(pixels: &[Color]) -> Vec<DataChunk> {
+    let mut data = vec![];
+    let mut previous = Color::BLACK;
+    let mut array = [Color::TRANS; 64];
+    let mut run_lenght: u64 = 0;
+    let mut first_run = true;
+    for pixel in pixels {
+        if *pixel == previous {
+            run_lenght += 1;
+            continue;
+        }
+        if run_lenght > 0 {
+            while run_lenght > 0 {
+                data.push(DataChunk::Run(u64::min(run_lenght, 62) as u8 - 1));
+                run_lenght -= u64::min(run_lenght, 62);
+            }
+            if first_run {
+                array[index_position(&previous)] = previous;
+                first_run = false;
+            }
+        }
+        if *pixel == array[index_position(pixel)] {
+            data.push(DataChunk::Index(index_position(pixel) as u8));
+        } else if pixel.a == previous.a {
+            let dr = pixel.r.wrapping_add(2).wrapping_sub(previous.r);
+            let dg = pixel.g.wrapping_add(2).wrapping_sub(previous.g);
+            let db = pixel.b.wrapping_add(2).wrapping_sub(previous.b);
+            if dr < 4 && dg < 4 && db < 4 {
+                data.push(DataChunk::Diff(dr, dg, db));
+            } else {
+                let dg = dg.wrapping_add(30);
+                let dr_dg = dr.wrapping_add(38).wrapping_sub(dg);
+                let db_dg = db.wrapping_add(38).wrapping_sub(dg);
+                if dg < 64 && dr_dg < 16 && db_dg < 16 {
+                    data.push(DataChunk::Luma(dg, dr_dg, db_dg));
+                } else {
+                    data.push(DataChunk::Rgb(pixel.r, pixel.g, pixel.b));
+                }
+            }
+        } else {
+            data.push(DataChunk::Rgba(pixel.r, pixel.g, pixel.b, pixel.a));
+        }
+        if *pixel != previous {
+            previous = *pixel;
+            array[index_position(pixel)] = *pixel;
+        }
+    }
+    while run_lenght > 0 {
+        data.push(DataChunk::Run(u64::min(run_lenght, 62) as u8 - 1));
+        run_lenght -= u64::min(run_lenght, 62);
+    }
+    data
+}
+
 /// Writes a Pimage to a QOI file.
-pub fn write_qoi(_path_name: &str, _pimage: &Pimage) -> Result<()> {
-    error("not yet done")
+pub fn write_qoi(path_name: &str, pimage: &Pimage) -> Result<()> {
+    let header = Header {
+        magic: ['q', 'o', 'i', 'f'],
+        width: pimage.width() as u32,
+        height: pimage.height() as u32,
+        channels: 4,
+        colorspace: 0,
+    };
+    let data = pixels_to_data(pimage.pixels());
+    let all_data = [
+        header.to_bytes(),
+        data.iter().flat_map(|d| d.to_bytes()).collect(),
+        vec![0, 0, 0, 0, 0, 0, 0, 1],
+    ];
+    let bytes: Vec<u8> = all_data.iter().flatten().copied().collect();
+    std::fs::write(path_name, bytes)?;
+    Ok(())
 }
 
 fn error<T>(string: &str) -> Result<T> {
